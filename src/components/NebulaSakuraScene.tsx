@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import type { PhotoAsset, SceneMode } from "../types";
+import type { IntroPhase, PhotoAsset, SceneMode } from "../types";
 
 type NebulaSakuraSceneProps = {
   photos: PhotoAsset[];
@@ -8,6 +8,10 @@ type NebulaSakuraSceneProps = {
   selectedIndex: number;
   transitionKey: number;
   transitionDirection: -1 | 0 | 1;
+  introPhase: IntroPhase;
+  introSpeed: number;
+  onIntroPhaseComplete: (phase: IntroPhase) => void;
+  onIntroError: () => void;
 };
 
 type PhotoEntry = {
@@ -23,7 +27,22 @@ type PhotoEntry = {
   sphere: THREE.Vector3;
   burst: THREE.Vector3;
   gallery: THREE.Vector3;
+  wallScatter: THREE.Vector3;
+  wallSlot: THREE.Vector3;
+  wallShardSeed: number;
   seed: number;
+};
+
+type PhotoShardLayer = {
+  points: THREE.Points;
+  geometry: THREE.BufferGeometry;
+  current: Float32Array;
+  scatter: Float32Array;
+  wall: Float32Array;
+  tree: Float32Array;
+  colors: Float32Array;
+  seeds: Float32Array;
+  sizes: Float32Array;
 };
 
 type MorphParticleLayer = {
@@ -173,6 +192,25 @@ const SAKURA_RAIN_CONFIG = {
   burstLookY: 3.05,
 };
 
+const INTRO_TIMING = {
+  speedAnchor: 5.69,
+  wallBaseMs: 4200,
+  wallMinMs: 2380,
+  morphBaseMs: 5200,
+  morphMinMs: 2860,
+  wallSettleMs: 360,
+  morphSettleMs: 260,
+};
+
+const PHOTO_SHARD_CONFIG = {
+  minCount: 900,
+  perPhoto: 120,
+  maxCount: 4600,
+  wallOpacity: 0.58,
+  morphOpacity: 0.76,
+  size: 0.052,
+};
+
 const CANOPY_CLUSTERS: CanopyCluster[] = [
   { center: new THREE.Vector3(0.0, 2.35, -0.55), radius: new THREE.Vector3(4.25, 2.75, 2.75), weight: 1.68, blueBias: 0.08, edgeBias: 0.14 },
   { center: new THREE.Vector3(-3.35, 1.48, -0.25), radius: new THREE.Vector3(3.85, 2.25, 2.45), weight: 1.18, blueBias: 0.34, edgeBias: 0.22 },
@@ -193,14 +231,25 @@ export function NebulaSakuraScene({
   selectedIndex,
   transitionKey,
   transitionDirection,
+  introPhase,
+  introSpeed,
+  onIntroPhaseComplete,
+  onIntroError,
 }: NebulaSakuraSceneProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const photoEntriesRef = useRef<PhotoEntry[]>([]);
+  const photoShardLayerRef = useRef<PhotoShardLayer | null>(null);
   const layersRef = useRef<ParticleLayers | null>(null);
   const modeRef = useRef(mode);
+  const introPhaseRef = useRef<IntroPhase>(introPhase);
+  const introSpeedRef = useRef(introSpeed);
+  const introStartedRef = useRef(performance.now());
+  const completedIntroPhaseRef = useRef<IntroPhase | null>(null);
+  const onIntroPhaseCompleteRef = useRef(onIntroPhaseComplete);
+  const onIntroErrorRef = useRef(onIntroError);
   const selectedRef = useRef(selectedIndex);
   const transitionKeyRef = useRef(transitionKey);
   const transitionDirectionRef = useRef(transitionDirection);
@@ -212,6 +261,24 @@ export function NebulaSakuraScene({
     modeRef.current = mode;
     modeStartedRef.current = performance.now();
   }, [mode]);
+
+  useEffect(() => {
+    introPhaseRef.current = introPhase;
+    introStartedRef.current = performance.now();
+    completedIntroPhaseRef.current = null;
+  }, [introPhase]);
+
+  useEffect(() => {
+    introSpeedRef.current = introSpeed;
+  }, [introSpeed]);
+
+  useEffect(() => {
+    onIntroPhaseCompleteRef.current = onIntroPhaseComplete;
+  }, [onIntroPhaseComplete]);
+
+  useEffect(() => {
+    onIntroErrorRef.current = onIntroError;
+  }, [onIntroError]);
 
   useEffect(() => {
     selectedRef.current = selectedIndex;
@@ -276,9 +343,25 @@ export function NebulaSakuraScene({
 
     const render = () => {
       const time = performance.now();
-      updateParticleLayers(layersRef.current, modeRef.current, time, modeStartedRef.current);
-      updatePhotos(photoEntriesRef.current, modeRef.current, selectedRef.current, time, modeStartedRef.current, transitionStartedRef.current, transitionDirectionRef.current);
-      updateSceneCamera(camera, modeRef.current, time, modeStartedRef.current);
+      const activeIntroPhase = introPhaseRef.current;
+      const activeIntroStarted = introStartedRef.current;
+      const activeIntroSpeed = introSpeedRef.current;
+      updateParticleLayers(layersRef.current, modeRef.current, time, modeStartedRef.current, activeIntroPhase, activeIntroStarted, activeIntroSpeed);
+      updatePhotoShardLayer(photoShardLayerRef.current, activeIntroPhase, time, activeIntroStarted, activeIntroSpeed);
+      updatePhotos(
+        photoEntriesRef.current,
+        modeRef.current,
+        selectedRef.current,
+        time,
+        modeStartedRef.current,
+        transitionStartedRef.current,
+        transitionDirectionRef.current,
+        activeIntroPhase,
+        activeIntroStarted,
+        activeIntroSpeed,
+      );
+      updateSceneCamera(camera, modeRef.current, time, modeStartedRef.current, activeIntroPhase, activeIntroStarted, activeIntroSpeed);
+      completeIntroPhaseIfReady(activeIntroPhase, time, activeIntroStarted, activeIntroSpeed, completedIntroPhaseRef, onIntroPhaseCompleteRef);
 
       renderer.render(scene, camera);
       frameRef.current = requestAnimationFrame(render);
@@ -293,6 +376,8 @@ export function NebulaSakuraScene({
       }
       disposePhotoEntries(photoEntriesRef.current, scene);
       photoEntriesRef.current = [];
+      disposePhotoShardLayer(photoShardLayerRef.current, scene);
+      photoShardLayerRef.current = null;
       disposeParticleLayers(layersRef.current);
       renderer.dispose();
       renderer.domElement.remove();
@@ -315,6 +400,8 @@ export function NebulaSakuraScene({
 
       disposePhotoEntries(photoEntriesRef.current, scene);
       photoEntriesRef.current = [];
+      disposePhotoShardLayer(photoShardLayerRef.current, scene);
+      photoShardLayerRef.current = null;
 
       if (photos.length === 0) {
         return;
@@ -328,6 +415,18 @@ export function NebulaSakuraScene({
 
       entries.forEach((entry) => scene.add(entry.group));
       photoEntriesRef.current = entries;
+
+      try {
+        const shardLayer = await createPhotoShardLayer(photos, entries);
+        if (cancelled || sceneRef.current !== scene) {
+          disposePhotoShardLayer(shardLayer, scene);
+          return;
+        }
+        scene.add(shardLayer.points);
+        photoShardLayerRef.current = shardLayer;
+      } catch {
+        onIntroErrorRef.current();
+      }
     }
 
     void rebuildPhotos();
@@ -348,10 +447,16 @@ function updatePhotos(
   modeStarted: number,
   transitionStarted: number,
   transitionDirection: -1 | 0 | 1,
+  introPhase: IntroPhase,
+  introStarted: number,
+  introSpeed: number,
 ) {
   const target = new THREE.Vector3();
   const targetScale = new THREE.Vector3();
   const elapsed = time - modeStarted;
+  const introElapsed = time - introStarted;
+  const wallDuration = getIntroDuration("photo-wall-enter", introSpeed);
+  const morphDuration = getIntroDuration("wall-to-tree", introSpeed);
   const burstPhase = clamp(elapsed / 3000, 0, 1);
   const transitionPhase = clamp((time - transitionStarted) / 850, 0, 1);
   const centerEase = easeOutCubic(transitionPhase);
@@ -364,7 +469,33 @@ function updatePhotos(
     let scale = 1;
     let desiredTexture = entry.texture;
 
-    if (mode === "idle") {
+    if (introPhase === "photo-wall-enter") {
+      const delay = getIntroEntryDelay(entry, index, introSpeed);
+      const local = clamp((introElapsed - delay) / (wallDuration * 0.72), 0, 1);
+      const eased = easeOutBack(local);
+      const settle = easeInOutCubic(clamp((introElapsed - wallDuration * 0.68) / (wallDuration * 0.32), 0, 1));
+      const jitter = 1 - settle;
+      desiredTexture = local > 0.38 ? entry.texture : entry.blurredTexture;
+      target.copy(entry.wallScatter).lerp(entry.wallSlot, eased);
+      target.x += Math.sin(local * Math.PI * 3.1 + entry.seed * 12) * jitter * 0.38;
+      target.y += Math.cos(local * Math.PI * 2.4 + entry.seed * 9) * jitter * 0.24;
+      target.z += Math.sin(local * Math.PI + entry.seed * 4) * (1 - local) * 1.15;
+      scale = lerp(0.34 + entry.seed * 0.34, 0.78, easeOutCubic(local));
+      opacity = 0.04 + easeOutCubic(local) * 0.88;
+      glow = 0.1 + easeOutCubic(local) * 0.38;
+    } else if (introPhase === "wall-to-tree") {
+      const phase = clamp(introElapsed / morphDuration, 0, 1);
+      const fold = easeInOutCubic(phase);
+      const inhale = Math.sin(clamp(phase / 0.34, 0, 1) * Math.PI) * 0.52;
+      desiredTexture = entry.texture;
+      target.copy(entry.wallSlot).multiplyScalar(1 - inhale * 0.12).lerp(entry.tree, fold);
+      target.x += wave * (0.16 + fold * 0.08);
+      target.y += drift * (0.12 + fold * 0.05);
+      target.z += Math.sin(time * 0.0007 + entry.seed) * lerp(0.08, 0.18, fold);
+      scale = lerp(0.78, 0.52 + (entry.seed % 0.18), fold);
+      opacity = 0.92 - fold * 0.06;
+      glow = 0.48 + fold * 0.04;
+    } else if (mode === "idle") {
       desiredTexture = entry.blurredTexture;
       target.copy(entry.idle);
       target.x += drift * 0.24;
@@ -442,38 +573,121 @@ function updatePhotos(
     targetScale.set(scale, scale, scale);
     entry.group.scale.lerp(targetScale, 0.06);
 
-    const targetRotY = mode === "viewer" && index === selectedIndex ? 0 : Math.sin(time * 0.00042 + entry.seed * 6) * 0.28;
-    const targetRotX = mode === "tree" ? Math.sin(time * 0.00052 + entry.seed) * 0.08 : Math.cos(time * 0.00034 + entry.seed) * 0.12;
+    const introWallActive = introPhase === "photo-wall-enter" || introPhase === "wall-to-tree";
+    const targetRotY = mode === "viewer" && index === selectedIndex
+      ? 0
+      : introWallActive
+        ? Math.sin(time * 0.00038 + entry.wallShardSeed * 6) * 0.1
+        : Math.sin(time * 0.00042 + entry.seed * 6) * 0.28;
+    const targetRotX = mode === "tree" || introPhase === "wall-to-tree" ? Math.sin(time * 0.00052 + entry.seed) * 0.08 : Math.cos(time * 0.00034 + entry.seed) * 0.12;
     entry.group.rotation.y += (targetRotY - entry.group.rotation.y) * 0.055;
     entry.group.rotation.x += (targetRotX - entry.group.rotation.x) * 0.055;
-    entry.group.rotation.z += (Math.sin(time * 0.00033 + entry.seed * 7) * 0.04 - entry.group.rotation.z) * 0.04;
+    const targetRotZ = introPhase === "photo-wall-enter"
+      ? Math.sin((1 - clamp((introElapsed - getIntroEntryDelay(entry, index, introSpeed)) / (wallDuration * 0.72), 0, 1)) * Math.PI + entry.seed * 5) * 0.16
+      : Math.sin(time * 0.00033 + entry.seed * 7) * 0.04;
+    entry.group.rotation.z += (targetRotZ - entry.group.rotation.z) * 0.04;
 
     entry.material.opacity += (opacity - entry.material.opacity) * 0.08;
     entry.glowMaterial.opacity += (glow - entry.glowMaterial.opacity) * 0.08;
   });
 }
 
-function updateParticleLayers(layers: ParticleLayers | null, mode: SceneMode, time: number, modeStarted: number) {
+function updateParticleLayers(
+  layers: ParticleLayers | null,
+  mode: SceneMode,
+  time: number,
+  modeStarted: number,
+  introPhase: IntroPhase,
+  introStarted: number,
+  introSpeed: number,
+) {
   if (!layers) {
     return;
   }
 
-  updateTreeCoreLayer(layers.treeCore, mode, time, modeStarted);
-  updateTreeGlowLayer(layers.treeGlow, mode, time);
-  updateAmbientLayer(layers.ambient, mode, time);
-  updateGroundPetalLayer(layers.groundPetals, mode, time);
+  updateTreeCoreLayer(layers.treeCore, mode, time, modeStarted, introPhase, introStarted, introSpeed);
+  updateTreeGlowLayer(layers.treeGlow, mode, time, introPhase);
+  updateAmbientLayer(layers.ambient, mode, time, introPhase);
+  updateGroundPetalLayer(layers.groundPetals, mode, time, introPhase);
   updatePetalRainLayer(layers.petalRain, mode, time, modeStarted);
 }
 
-function updateTreeCoreLayer(layer: MorphParticleLayer, mode: SceneMode, time: number, modeStarted: number) {
-  const elapsed = time - modeStarted;
+function updatePhotoShardLayer(layer: PhotoShardLayer | null, introPhase: IntroPhase, time: number, introStarted: number, introSpeed: number) {
+  if (!layer) {
+    return;
+  }
+
   const positions = layer.geometry.getAttribute("position") as THREE.BufferAttribute;
-  const targetArray = mode === "tree" ? layer.tree : layer.idle;
-  const stableTree = mode === "tree" && elapsed > TREE_SHAPE_CONFIG.treeStableAfter;
-  const modeMix = mode === "tree"
+  const sizes = layer.geometry.getAttribute("size") as THREE.BufferAttribute | undefined;
+  const elapsed = time - introStarted;
+  const wallDuration = getIntroDuration("photo-wall-enter", introSpeed);
+  const morphDuration = getIntroDuration("wall-to-tree", introSpeed);
+  let targetOpacity = 0;
+
+  for (let i = 0; i < layer.seeds.length; i += 1) {
+    const offset = i * 3;
+    const seed = layer.seeds[i];
+    const target = new THREE.Vector3(layer.scatter[offset], layer.scatter[offset + 1], layer.scatter[offset + 2]);
+    let local = 0;
+
+    if (introPhase === "photo-wall-enter") {
+      const delay = (40 + hash01(i * 17 + 3) * 280) / Math.max(1, introSpeed / INTRO_TIMING.speedAnchor);
+      local = clamp((elapsed - delay) / (wallDuration * 0.68), 0, 1);
+      const drift = 1 - easeInOutCubic(clamp((elapsed - wallDuration * 0.68) / (wallDuration * 0.32), 0, 1));
+      target.lerp(new THREE.Vector3(layer.wall[offset], layer.wall[offset + 1], layer.wall[offset + 2]), easeOutCubic(local));
+      target.x += Math.sin(time * 0.0012 + seed * 22) * 0.16 * drift;
+      target.y += Math.cos(time * 0.001 + seed * 19) * 0.12 * drift;
+      targetOpacity = PHOTO_SHARD_CONFIG.wallOpacity;
+    } else if (introPhase === "wall-to-tree") {
+      local = clamp(elapsed / morphDuration, 0, 1);
+      const flow = easeInOutCubic(local);
+      target.set(layer.wall[offset], layer.wall[offset + 1], layer.wall[offset + 2]);
+      target.multiplyScalar(1 - Math.sin(clamp(local / 0.3, 0, 1) * Math.PI) * 0.11);
+      target.lerp(new THREE.Vector3(layer.tree[offset], layer.tree[offset + 1], layer.tree[offset + 2]), flow);
+      target.x += Math.sin(time * 0.001 + seed * 29 + local * 5.4) * 0.22 * (1 - flow);
+      target.z += Math.cos(time * 0.0009 + seed * 31) * 0.18 * (1 - flow);
+      targetOpacity = PHOTO_SHARD_CONFIG.morphOpacity * (1 - clamp((local - 0.82) / 0.18, 0, 1) * 0.55);
+    }
+
+    layer.current[offset] += (target.x - layer.current[offset]) * 0.09;
+    layer.current[offset + 1] += (target.y - layer.current[offset + 1]) * 0.09;
+    layer.current[offset + 2] += (target.z - layer.current[offset + 2]) * 0.09;
+
+    if (sizes) {
+      const size = layer.sizes[i] * (0.55 + easeOutCubic(local) * 0.7);
+      sizes.setX(i, size);
+    }
+  }
+
+  positions.needsUpdate = true;
+  if (sizes) {
+    sizes.needsUpdate = true;
+  }
+  setLayerOpacity(layer.points, targetOpacity, 0.08);
+}
+
+function updateTreeCoreLayer(
+  layer: MorphParticleLayer,
+  mode: SceneMode,
+  time: number,
+  modeStarted: number,
+  introPhase: IntroPhase,
+  introStarted: number,
+  introSpeed: number,
+) {
+  const elapsed = time - modeStarted;
+  const introElapsed = time - introStarted;
+  const introMorphing = introPhase === "wall-to-tree";
+  const introTreeProgress = introMorphing ? easeInOutCubic(clamp(introElapsed / getIntroDuration("wall-to-tree", introSpeed), 0, 1)) : 0;
+  const positions = layer.geometry.getAttribute("position") as THREE.BufferAttribute;
+  const targetArray = mode === "tree" || introMorphing ? layer.tree : layer.idle;
+  const stableTree = (mode === "tree" && elapsed > TREE_SHAPE_CONFIG.treeStableAfter) || (introMorphing && introTreeProgress > 0.86);
+  const modeMix = introMorphing
+    ? lerp(0.034, 0.088, introTreeProgress)
+    : mode === "tree"
     ? stableTree ? TREE_SHAPE_CONFIG.structureLockStrength : TREE_SHAPE_CONFIG.treeFormationMix
     : mode === "burst" ? 0.105 : 0.026;
-  const treeBreath = mode === "tree" ? TREE_SHAPE_CONFIG.treeBreathAmplitude * (stableTree ? 0.72 : 1.18) : 0;
+  const treeBreath = mode === "tree" || introMorphing ? TREE_SHAPE_CONFIG.treeBreathAmplitude * (stableTree ? 0.72 : 1.18) * (introMorphing ? introTreeProgress : 1) : 0;
   const rainTarget = new THREE.Vector3();
 
   for (let i = 0; i < layer.current.length; i += 3) {
@@ -489,7 +703,7 @@ function updateTreeCoreLayer(layer: MorphParticleLayer, mode: SceneMode, time: n
       continue;
     }
 
-    const freeDrift = mode === "tree" ? 0 : 1;
+    const freeDrift = mode === "tree" || introMorphing ? 0 : 1;
     const swirl = Math.sin(time * 0.0007 + seed * 19) * 0.018 * freeDrift;
     const flutter = Math.cos(time * 0.00053 + seed * 13) * 0.014 * freeDrift;
     const breathX = Math.sin(time * 0.00042 + seed * 19) * treeBreath * motionScale;
@@ -506,7 +720,8 @@ function updateTreeCoreLayer(layer: MorphParticleLayer, mode: SceneMode, time: n
 
   positions.needsUpdate = true;
   layer.points.rotation.set(0, 0, 0);
-  setLayerOpacity(layer.points, mode === "burst" ? 0.68 : mode === "tree" ? 0.9 : 0.78, 0.035);
+  const introOpacity = introPhase === "photo-wall-enter" ? 0.34 : introMorphing ? lerp(0.38, 0.9, introTreeProgress) : null;
+  setLayerOpacity(layer.points, introOpacity ?? (mode === "burst" ? 0.68 : mode === "tree" ? 0.9 : 0.78), 0.035);
 }
 
 function buildTreeCoreRainTarget(
@@ -543,10 +758,13 @@ function buildTreeCoreRainTarget(
   );
 }
 
-function updateAmbientLayer(layer: DecorativeParticleLayer, mode: SceneMode, time: number) {
+function updateAmbientLayer(layer: DecorativeParticleLayer, mode: SceneMode, time: number, introPhase: IntroPhase) {
   const positions = layer.geometry.getAttribute("position") as THREE.BufferAttribute;
-  const targetOpacity = mode === "tree" ? TREE_SHAPE_CONFIG.ambientOpacity : mode === "burst" ? TREE_SHAPE_CONFIG.ambientBurstOpacity : TREE_SHAPE_CONFIG.ambientIdleOpacity;
-  const amplitude = TREE_SHAPE_CONFIG.ambientMotionAmplitude * (mode === "tree" ? 1 : 1.4);
+  const treeLike = mode === "tree" || introPhase === "wall-to-tree";
+  const targetOpacity = introPhase === "photo-wall-enter"
+    ? 0.14
+    : treeLike ? TREE_SHAPE_CONFIG.ambientOpacity : mode === "burst" ? TREE_SHAPE_CONFIG.ambientBurstOpacity : TREE_SHAPE_CONFIG.ambientIdleOpacity;
+  const amplitude = TREE_SHAPE_CONFIG.ambientMotionAmplitude * (treeLike ? 1 : 1.4);
   const speed = TREE_SHAPE_CONFIG.ambientMotionSpeed;
 
   for (let i = 0; i < layer.current.length; i += 3) {
@@ -564,13 +782,14 @@ function updateAmbientLayer(layer: DecorativeParticleLayer, mode: SceneMode, tim
   setLayerOpacity(layer.points, targetOpacity, 0.035);
 }
 
-function updateTreeGlowLayer(layer: GlowParticleLayer, mode: SceneMode, time: number) {
+function updateTreeGlowLayer(layer: GlowParticleLayer, mode: SceneMode, time: number, introPhase: IntroPhase) {
   const positions = layer.geometry.getAttribute("position") as THREE.BufferAttribute;
   const colors = layer.geometry.getAttribute("color") as THREE.BufferAttribute;
-  const targetOpacity = mode === "tree"
+  const treeLike = mode === "tree" || introPhase === "wall-to-tree";
+  const targetOpacity = treeLike
     ? TREE_SHAPE_CONFIG.treeGlowOpacity
     : mode === "burst" ? TREE_SHAPE_CONFIG.treeGlowBurstOpacity : 0.03;
-  const amplitude = TREE_SHAPE_CONFIG.treeGlowMotionAmplitude * (mode === "tree" ? 1 : 0.42);
+  const amplitude = TREE_SHAPE_CONFIG.treeGlowMotionAmplitude * (treeLike ? 1 : 0.42);
 
   for (let i = 0; i < layer.current.length; i += 3) {
     const particle = i / 3;
@@ -593,9 +812,10 @@ function updateTreeGlowLayer(layer: GlowParticleLayer, mode: SceneMode, time: nu
   setLayerOpacity(layer.points, targetOpacity, 0.045);
 }
 
-function updateGroundPetalLayer(layer: DecorativeParticleLayer, mode: SceneMode, time: number) {
+function updateGroundPetalLayer(layer: DecorativeParticleLayer, mode: SceneMode, time: number, introPhase: IntroPhase) {
   const positions = layer.geometry.getAttribute("position") as THREE.BufferAttribute;
-  const targetOpacity = mode === "tree" ? TREE_SHAPE_CONFIG.groundOpacity : mode === "burst" ? TREE_SHAPE_CONFIG.groundOpacity * 0.34 : 0.025;
+  const treeLike = mode === "tree" || introPhase === "wall-to-tree";
+  const targetOpacity = treeLike ? TREE_SHAPE_CONFIG.groundOpacity : mode === "burst" ? TREE_SHAPE_CONFIG.groundOpacity * 0.34 : 0.025;
   const amplitude = TREE_SHAPE_CONFIG.groundMotionAmplitude;
 
   for (let i = 0; i < layer.current.length; i += 3) {
@@ -674,7 +894,39 @@ function updatePetalRainLayer(layer: PetalRainLayer, mode: SceneMode, time: numb
   }
 }
 
-function updateSceneCamera(camera: THREE.PerspectiveCamera, mode: SceneMode, time: number, modeStarted: number) {
+function updateSceneCamera(
+  camera: THREE.PerspectiveCamera,
+  mode: SceneMode,
+  time: number,
+  modeStarted: number,
+  introPhase: IntroPhase,
+  introStarted: number,
+  introSpeed: number,
+) {
+  if (introPhase === "photo-wall-enter") {
+    const elapsed = time - introStarted;
+    const introPulse = Math.sin(elapsed * 0.0018) * 0.08;
+    camera.position.x += (introPulse - camera.position.x) * 0.032;
+    camera.position.y += (0.08 - camera.position.y) * 0.032;
+    camera.position.z += (13.8 - camera.position.z) * 0.032;
+    camera.lookAt(0, 0.12, -1.2);
+    return;
+  }
+
+  if (introPhase === "wall-to-tree") {
+    const elapsed = time - introStarted;
+    const phase = easeInOutCubic(clamp(elapsed / getIntroDuration("wall-to-tree", introSpeed), 0, 1));
+    const orbit = Math.sin(time * TREE_SHAPE_CONFIG.treeRotationSpeed) * TREE_SHAPE_CONFIG.treeRotationAmplitude * phase;
+    const targetX = lerp(0, Math.sin(orbit) * TREE_SHAPE_CONFIG.cameraOrbitRadius, phase);
+    const targetY = lerp(0.08, 0.42 + Math.sin(time * 0.00022) * 0.12, phase);
+    const targetZ = lerp(13.8, 18 - (1 - Math.cos(orbit)) * TREE_SHAPE_CONFIG.cameraOrbitDepth, phase);
+    camera.position.x += (targetX - camera.position.x) * 0.026;
+    camera.position.y += (targetY - camera.position.y) * 0.026;
+    camera.position.z += (targetZ - camera.position.z) * 0.026;
+    camera.lookAt(0, lerp(0.12, 0.72, phase), lerp(-1.2, -0.35, phase));
+    return;
+  }
+
   if (mode === "tree") {
     const orbit = Math.sin(time * TREE_SHAPE_CONFIG.treeRotationSpeed) * TREE_SHAPE_CONFIG.treeRotationAmplitude;
     const targetX = Math.sin(orbit) * TREE_SHAPE_CONFIG.cameraOrbitRadius;
@@ -759,6 +1011,9 @@ async function createPhotoEntry(photo: PhotoAsset, index: number, total: number)
   const sphere = buildSpherePosition(index, total, 2.35);
   const burst = idle.clone().multiplyScalar(1.12);
   const gallery = buildGalleryPosition(index, total);
+  const wallSlot = buildPhotoWallSlotPosition(index, total, aspect);
+  const wallScatter = buildPhotoWallScatterPosition(index, total, wallSlot);
+  const wallShardSeed = hash01(index * 97 + total * 13);
   group.position.copy(idle);
   group.scale.setScalar(0.64 + seed * 0.16);
 
@@ -775,8 +1030,77 @@ async function createPhotoEntry(photo: PhotoAsset, index: number, total: number)
     sphere,
     burst,
     gallery,
+    wallScatter,
+    wallSlot,
+    wallShardSeed,
     seed,
   };
+}
+
+async function createPhotoShardLayer(photos: PhotoAsset[], entries: PhotoEntry[]): Promise<PhotoShardLayer> {
+  const palette = await samplePhotoPalette(photos);
+  const count = Math.min(PHOTO_SHARD_CONFIG.maxCount, Math.max(PHOTO_SHARD_CONFIG.minCount, photos.length * PHOTO_SHARD_CONFIG.perPhoto));
+  const current = new Float32Array(count * 3);
+  const scatter = new Float32Array(count * 3);
+  const wall = new Float32Array(count * 3);
+  const tree = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const seeds = new Float32Array(count);
+  const sizes = new Float32Array(count);
+
+  for (let i = 0; i < count; i += 1) {
+    const entry = entries[i % entries.length];
+    const seed = hash01(i * 97 + entry.wallShardSeed * 113);
+    const offset = i * 3;
+    const localX = (hash01(i * 101 + 3) - 0.5) * PHOTO_HEIGHT * entry.aspect * 0.86;
+    const localY = (hash01(i * 103 + 5) - 0.5) * PHOTO_HEIGHT * 0.86;
+    const localZ = (hash01(i * 107 + 7) - 0.5) * 0.16;
+    const wallPos = new THREE.Vector3(
+      entry.wallSlot.x + localX,
+      entry.wallSlot.y + localY,
+      entry.wallSlot.z + localZ,
+    );
+    const scatterPos = wallPos.clone().lerp(entry.wallScatter, 0.54 + seed * 0.32);
+    scatterPos.x += (hash01(i * 109 + 11) - 0.5) * 2.2;
+    scatterPos.y += (hash01(i * 113 + 13) - 0.5) * 1.8;
+    scatterPos.z -= 1.2 + hash01(i * 127 + 17) * 3.4;
+
+    const treeSample = buildTreeParticle(i + 29000, count + 29000, seed);
+    const treePos = treeSample.position.clone();
+    treePos.x += (hash01(i * 131 + 19) - 0.5) * 0.18;
+    treePos.y += (hash01(i * 137 + 23) - 0.5) * 0.14;
+    treePos.z += (hash01(i * 139 + 29) - 0.5) * 0.18;
+
+    scatter.set([scatterPos.x, scatterPos.y, scatterPos.z], offset);
+    wall.set([wallPos.x, wallPos.y, wallPos.z], offset);
+    tree.set([treePos.x, treePos.y, treePos.z], offset);
+    current.set([scatterPos.x, scatterPos.y, scatterPos.z], offset);
+
+    const color = palette[Math.floor(hash01(i * 149 + 31) * palette.length)] ?? treeSample.color;
+    const blended = color.clone().lerp(treeSample.color, treeSample.kind === "canopy" ? 0.42 : 0.68);
+    colors.set([blended.r, blended.g, blended.b], offset);
+    seeds[i] = seed;
+    sizes[i] = PHOTO_SHARD_CONFIG.size * (0.7 + seed * 0.9);
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(current, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute("size", new THREE.BufferAttribute(sizes, 1));
+
+  const material = new THREE.PointsMaterial({
+    size: PHOTO_SHARD_CONFIG.size,
+    transparent: true,
+    opacity: 0,
+    vertexColors: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    sizeAttenuation: true,
+  });
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+
+  return { points, geometry, current, scatter, wall, tree, colors, seeds, sizes };
 }
 
 function createParticleLayers(): ParticleLayers {
@@ -1015,6 +1339,37 @@ function buildIdlePosition(index: number, total: number) {
     ((rows - 1) / 2 - row) * ySpacing + Math.cos(col * 0.91) * 0.16 + yJitter,
     -8.9 + depthLane * 1.28 + zJitter,
   );
+}
+
+function buildPhotoWallSlotPosition(index: number, total: number, aspect: number) {
+  const columns = Math.min(8, Math.max(2, Math.ceil(Math.sqrt(total * 1.62))));
+  const rows = Math.ceil(total / columns);
+  const col = index % columns;
+  const row = Math.floor(index / columns);
+  const compact = total > 20;
+  const xSpacing = compact ? 1.52 : 1.72;
+  const ySpacing = compact ? 1.08 : 1.22;
+  const edgeOffset = (hash01(index * 31 + total) - 0.5) * (compact ? 0.1 : 0.16);
+  const aspectNudge = (aspect - 1) * 0.18;
+  return new THREE.Vector3(
+    (col - (columns - 1) / 2) * xSpacing + edgeOffset + aspectNudge,
+    ((rows - 1) / 2 - row) * ySpacing + (hash01(index * 37 + 9) - 0.5) * 0.12,
+    -1.3 + (hash01(index * 41 + 11) - 0.5) * 0.42 + row * 0.025,
+  );
+}
+
+function buildPhotoWallScatterPosition(index: number, total: number, wallSlot: THREE.Vector3) {
+  const seed = hash01(index * 43 + total * 7);
+  const side = seed < 0.5 ? -1 : 1;
+  const verticalSide = hash01(index * 47 + 5) < 0.34;
+  const x = verticalSide
+    ? wallSlot.x + (hash01(index * 53 + 7) - 0.5) * 4.2
+    : side * (7.8 + hash01(index * 59 + 11) * 4.8);
+  const y = verticalSide
+    ? (seed < 0.25 ? -1 : 1) * (4.8 + hash01(index * 61 + 13) * 2.5)
+    : wallSlot.y + (hash01(index * 67 + 17) - 0.5) * 5.2;
+  const z = -8.4 - hash01(index * 71 + 19) * 7.6;
+  return new THREE.Vector3(x, y, z);
 }
 
 function buildTreePhotoPosition(index: number, total: number) {
@@ -1444,6 +1799,46 @@ function loadTexture(url: string) {
   });
 }
 
+async function samplePhotoPalette(photos: PhotoAsset[]) {
+  const colors: THREE.Color[] = [];
+  const canvas = document.createElement("canvas");
+  canvas.width = 18;
+  canvas.height = 18;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    throw new Error("Canvas 2D context is unavailable.");
+  }
+
+  for (const [photoIndex, photo] of photos.entries()) {
+    try {
+      const image = await loadImageElement(photo.previewUrl);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      for (let sample = 0; sample < 9; sample += 1) {
+        const x = Math.floor(hash01(photoIndex * 211 + sample * 17) * canvas.width);
+        const y = Math.floor(hash01(photoIndex * 223 + sample * 19) * canvas.height);
+        const offset = (y * canvas.width + x) * 4;
+        const color = new THREE.Color(data[offset] / 255, data[offset + 1] / 255, data[offset + 2] / 255);
+        colors.push(color.lerp(new THREE.Color(0xffd4e6), 0.16));
+      }
+    } catch {
+      colors.push(new THREE.Color(0xff9fca), new THREE.Color(0x86dfff), new THREE.Color(0xffd58c));
+    }
+  }
+
+  return colors.length > 0 ? colors : [new THREE.Color(0xff9fca), new THREE.Color(0x86dfff), new THREE.Color(0xffd58c)];
+}
+
+function loadImageElement(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = reject;
+    image.src = src;
+  });
+}
+
 function disposePhotoEntries(entries: PhotoEntry[], scene: THREE.Scene) {
   entries.forEach((entry) => {
     scene.remove(entry.group);
@@ -1472,6 +1867,14 @@ function disposeParticleLayers(layers: ParticleLayers | null) {
   disposePetalRainLayer(layers.petalRain);
 }
 
+function disposePhotoShardLayer(layer: PhotoShardLayer | null, scene: THREE.Scene) {
+  if (!layer) {
+    return;
+  }
+  scene.remove(layer.points);
+  disposePointsLayer(layer.points, layer.geometry);
+}
+
 function disposePointsLayer(points: THREE.Points, geometry: THREE.BufferGeometry) {
   geometry.dispose();
   const material = points.material;
@@ -1486,6 +1889,44 @@ function disposePetalRainLayer(layer: PetalRainLayer) {
   layer.geometry.dispose();
   layer.texture.dispose();
   layer.material.dispose();
+}
+
+function completeIntroPhaseIfReady(
+  phase: IntroPhase,
+  time: number,
+  started: number,
+  speed: number,
+  completedRef: { current: IntroPhase | null },
+  completeRef: { current: (phase: IntroPhase) => void },
+) {
+  if (phase !== "photo-wall-enter" && phase !== "wall-to-tree") {
+    return;
+  }
+
+  const settle = phase === "photo-wall-enter" ? INTRO_TIMING.wallSettleMs : INTRO_TIMING.morphSettleMs;
+  const duration = getIntroDuration(phase, speed) + settle;
+  if (time - started < duration || completedRef.current === phase) {
+    return;
+  }
+
+  completedRef.current = phase;
+  completeRef.current(phase);
+}
+
+function getIntroDuration(phase: IntroPhase, speed: number) {
+  const normalizedSpeed = Math.max(0.1, speed);
+  if (phase === "photo-wall-enter") {
+    return Math.max(INTRO_TIMING.wallMinMs, INTRO_TIMING.wallBaseMs / normalizedSpeed);
+  }
+  if (phase === "wall-to-tree") {
+    return Math.max(INTRO_TIMING.morphMinMs, INTRO_TIMING.morphBaseMs / normalizedSpeed);
+  }
+  return 0;
+}
+
+function getIntroEntryDelay(entry: PhotoEntry, index: number, speed: number) {
+  const tempoScale = Math.max(0.72, Math.min(1.08, INTRO_TIMING.speedAnchor / Math.max(1, speed)));
+  return (40 + hash01(index * 157 + entry.wallShardSeed * 29) * 280) * tempoScale;
 }
 
 function hash01(value: number) {
@@ -1504,6 +1945,13 @@ function lerp(start: number, end: number, amount: number) {
 function easeOutCubic(value: number) {
   const t = clamp(value, 0, 1);
   return 1 - Math.pow(1 - t, 3);
+}
+
+function easeOutBack(value: number) {
+  const t = clamp(value, 0, 1);
+  const c1 = 1.36;
+  const c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
 }
 
 function easeInOutCubic(value: number) {

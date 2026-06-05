@@ -49,3 +49,5 @@ Thumbs.db
 !public/**/*.jpeg
 !public/**/*.webp
 !public/**/*.gif
+!public/**/*.mp3
+!public/**/*.mp4

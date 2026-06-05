@@ -1,5 +1,7 @@
 export type SceneMode = "idle" | "tree" | "burst" | "viewer" | "gallery";
 
+export type IntroPhase = "idle" | "video-prelude" | "photo-wall-enter" | "wall-to-tree" | "complete" | "skipped";
+
 export type GestureName = "fist" | "openPalm" | "swipeLeft" | "swipeRight" | "swipeUp";
 
 export type PhotoAsset = {

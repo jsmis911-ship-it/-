@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { IntroMediaPrelude } from "./components/IntroMediaPrelude";
 import { NebulaSakuraScene } from "./components/NebulaSakuraScene";
 import { useGestureControl, type EnabledGestureZones, type GestureDebugInfo, type GestureZone } from "./hooks/useGestureControl";
 import { preparePhotoAssets } from "./lib/photoAssets";
-import type { GestureName, PhotoAsset, SceneMode } from "./types";
+import type { GestureName, IntroPhase, PhotoAsset, SceneMode } from "./types";
+
+const INTRO_VIDEO_SRC = "/intro-media/intro-video.mp4";
+const INTRO_AUDIO_SRC = "/intro-media/intro-audio.mp3";
+const INTRO_SPEED = 5.69;
 
 const gestureLabels: Record<GestureName, string> = {
   fist: "握拳",
@@ -20,7 +25,7 @@ const modeLabels: Record<SceneMode, string> = {
   gallery: "整理图库",
 };
 
-type GestureFlowState = "INIT_FLOATING" | "TREE_READY" | "PETAL_RAIN" | "PHOTO_BROWSING" | "GALLERY_BROWSING";
+type GestureFlowState = "INTRO_LOCKED" | "INIT_FLOATING" | "TREE_READY" | "PETAL_RAIN" | "PHOTO_BROWSING" | "GALLERY_BROWSING";
 
 type GestureActionDebug = {
   currentState: GestureFlowState;
@@ -64,6 +69,9 @@ function App() {
   const [uploadBusy, setUploadBusy] = useState(false);
   const [notice, setNotice] = useState("上传 1-32 张图片后即可开始。");
   const [dockOpen, setDockOpen] = useState(false);
+  const [introPhase, setIntroPhase] = useState<IntroPhase>("idle");
+  const [introPlaybackKey, setIntroPlaybackKey] = useState(0);
+  const [introMediaStopKey, setIntroMediaStopKey] = useState(0);
   const [gestureActionDebug, setGestureActionDebug] = useState<GestureActionDebug>(() => ({
     currentState: "INIT_FLOATING",
     detectedGesture: null,
@@ -81,8 +89,12 @@ function App() {
     }
   }, []);
 
+  const introLocked = isIntroLocked(introPhase);
+
   const resetExperience = useCallback(() => {
     clearBurstTimer();
+    setIntroPhase("idle");
+    setIntroMediaStopKey((value) => value + 1);
     setMode("idle");
     setSelectedIndex(0);
     setGalleryFocusIndex(null);
@@ -112,8 +124,8 @@ function App() {
   const handleGesture = useCallback(
     (gesture: GestureName) => {
       const now = performance.now();
-      const currentState = deriveGestureFlowState(mode);
-      const allowed = gesture === "swipeUp" || isGestureAllowedInState(currentState, gesture);
+      const currentState = introLocked ? "INTRO_LOCKED" : deriveGestureFlowState(mode);
+      const allowed = !introLocked && (gesture === "swipeUp" || isGestureAllowedInState(currentState, gesture));
       const writeDebug = (ignoredReason: string, success = false) => {
         const cooldowns = getActionCooldowns(actionLastRef.current, now);
         const globalCooldown = Math.max(0, ACTION_GLOBAL_COOLDOWN - (now - globalActionLastRef.current));
@@ -133,6 +145,11 @@ function App() {
           return next;
         });
       };
+
+      if (introLocked) {
+        writeDebug("intro animation locked");
+        return false;
+      }
 
       const cooldowns = getActionCooldowns(actionLastRef.current, now);
       const globalRemaining = Math.max(0, ACTION_GLOBAL_COOLDOWN - (now - globalActionLastRef.current));
@@ -236,10 +253,10 @@ function App() {
       writeDebug("no action for state");
       return false;
     },
-    [clearBurstTimer, galleryFocusIndex, goToPhoto, mode, photos.length, resetExperience, selectedIndex],
+    [clearBurstTimer, galleryFocusIndex, goToPhoto, introLocked, mode, photos.length, resetExperience, selectedIndex],
   );
 
-  const currentFlowState = deriveGestureFlowState(mode);
+  const currentFlowState = introLocked ? "INTRO_LOCKED" : deriveGestureFlowState(mode);
   const zonePermissions = useMemo(() => getZonePermissions(currentFlowState), [currentFlowState]);
   const { videoRef, status, lastGesture, debugInfo: recognizerDebug, start, stop } = useGestureControl({
     onGesture: handleGesture,
@@ -253,6 +270,8 @@ function App() {
       }
 
       setUploadBusy(true);
+      setIntroPhase("idle");
+      setIntroMediaStopKey((value) => value + 1);
       setNotice("正在处理高清图片纹理...");
 
       try {
@@ -265,7 +284,18 @@ function App() {
         setTransitionKey((value) => value + 1);
 
         const prefix = result.assets.length > 0 ? `已载入 ${result.assets.length} 张图片。` : "没有载入有效图片。";
-        setNotice([prefix, ...result.warnings].join(" "));
+        if (result.assets.length > 0 && shouldReduceMotion()) {
+          setMode("tree");
+          setIntroPhase("complete");
+          setNotice([`${prefix} 已按系统减少动态效果设置直接进入樱花树。`, ...result.warnings].join(" "));
+        } else if (result.assets.length > 0) {
+          setIntroPlaybackKey((value) => value + 1);
+          setIntroPhase("video-prelude");
+          setNotice([`${prefix} 开场视频正在播放。`, ...result.warnings].join(" "));
+        } else {
+          setIntroPhase("idle");
+          setNotice([prefix, ...result.warnings].join(" "));
+        }
       } finally {
         setUploadBusy(false);
         if (fileInputRef.current) {
@@ -286,6 +316,52 @@ function App() {
     },
     [photos.length],
   );
+
+  const handleIntroVideoEnded = useCallback(() => {
+    setIntroPhase((phase) => {
+      if (phase !== "video-prelude") {
+        return phase;
+      }
+      setNotice("开场视频结束，照片墙正在入场。");
+      return "photo-wall-enter";
+    });
+  }, []);
+
+  const handleIntroVideoError = useCallback(() => {
+    setIntroPhase((phase) => {
+      if (phase !== "video-prelude") {
+        return phase;
+      }
+      setIntroMediaStopKey((value) => value + 1);
+      setNotice("开场视频无法播放，已跳过视频前奏，照片墙正在入场。");
+      return "photo-wall-enter";
+    });
+  }, []);
+
+  const handleIntroAudioError = useCallback(() => {
+    setNotice((current) => `${current} 音频无法播放，视频和后续动画继续。`);
+  }, []);
+
+  const handleIntroPhaseComplete = useCallback((phase: IntroPhase) => {
+    if (phase === "photo-wall-enter") {
+      setIntroPhase("wall-to-tree");
+      setNotice("照片墙正在无缝形变为樱花树。");
+      return;
+    }
+
+    if (phase === "wall-to-tree") {
+      setMode("tree");
+      setIntroPhase("complete");
+      setNotice("樱花树已成型，可以使用手势交互。");
+    }
+  }, []);
+
+  const handleIntroSceneError = useCallback(() => {
+    setIntroPhase("skipped");
+    setIntroMediaStopKey((value) => value + 1);
+    setMode("idle");
+    setNotice("入场动画已跳过，基础手势相框可继续使用。");
+  }, []);
 
   useEffect(() => {
     const media = window.matchMedia("(hover: hover) and (pointer: fine) and (min-width: 921px)");
@@ -351,10 +427,13 @@ function App() {
 
   const selectedLabel = mode === "gallery" && galleryFocusIndex !== null ? galleryFocusIndex + 1 : selectedIndex + 1;
   const allowedGestures = getAllowedGestures(currentFlowState);
+  const appShellClass = ["app-shell", dockOpen ? "controls-open" : "", introLocked ? "is-intro-locked" : ""]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <main
-      className={dockOpen ? "app-shell controls-open" : "app-shell"}
+      className={appShellClass}
       onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
         event.preventDefault();
@@ -368,6 +447,21 @@ function App() {
         selectedIndex={selectedIndex}
         transitionKey={transitionKey}
         transitionDirection={transitionDirection}
+        introPhase={introPhase}
+        introSpeed={INTRO_SPEED}
+        onIntroPhaseComplete={handleIntroPhaseComplete}
+        onIntroError={handleIntroSceneError}
+      />
+
+      <IntroMediaPrelude
+        visible={introPhase === "video-prelude" && photos.length > 0}
+        playbackKey={introPlaybackKey}
+        stopKey={introMediaStopKey}
+        videoSrc={INTRO_VIDEO_SRC}
+        audioSrc={INTRO_AUDIO_SRC}
+        onVideoEnded={handleIntroVideoEnded}
+        onVideoError={handleIntroVideoError}
+        onAudioError={handleIntroAudioError}
       />
 
       {mode === "burst" && photos[0] && (
@@ -418,19 +512,19 @@ function App() {
         onMouseEnter={() => setDockOpen(true)}
         onFocus={() => setDockOpen(true)}
       >
-        <button type="button" onClick={() => handleGesture("fist")} title="F">
+        <button type="button" onClick={() => handleGesture("fist")} disabled={introLocked} title="F">
           握拳成树
         </button>
-        <button type="button" onClick={() => handleGesture("openPalm")} title="O / Space">
+        <button type="button" onClick={() => handleGesture("openPalm")} disabled={introLocked} title="O / Space">
           张掌散开
         </button>
-        <button type="button" onClick={() => handleGesture("swipeLeft")} title="ArrowRight">
+        <button type="button" onClick={() => handleGesture("swipeLeft")} disabled={introLocked} title="ArrowRight">
           右区 下一张
         </button>
-        <button type="button" onClick={() => handleGesture("swipeRight")} title="ArrowLeft">
+        <button type="button" onClick={() => handleGesture("swipeRight")} disabled={introLocked} title="ArrowLeft">
           左区 上一张
         </button>
-        <button type="button" onClick={() => handleGesture("swipeUp")} title="ArrowUp / R">
+        <button type="button" onClick={() => handleGesture("swipeUp")} disabled={introLocked} title="ArrowUp / R">
           上方重置
         </button>
       </section>
@@ -523,6 +617,9 @@ function deriveGestureFlowState(mode: SceneMode): GestureFlowState {
 }
 
 function getAllowedGestures(state: GestureFlowState): GestureName[] {
+  if (state === "INTRO_LOCKED") {
+    return [];
+  }
   if (state === "INIT_FLOATING") {
     return ["fist", "swipeUp"];
   }
@@ -533,6 +630,13 @@ function getAllowedGestures(state: GestureFlowState): GestureName[] {
 }
 
 function getZonePermissions(state: GestureFlowState): EnabledGestureZones {
+  if (state === "INTRO_LOCKED") {
+    return {
+      side: false,
+      center: false,
+      reset: false,
+    };
+  }
   const sideEnabled = state === "PETAL_RAIN" || state === "PHOTO_BROWSING" || state === "GALLERY_BROWSING";
   return {
     side: sideEnabled,
@@ -543,6 +647,14 @@ function getZonePermissions(state: GestureFlowState): EnabledGestureZones {
 
 function isGestureAllowedInState(state: GestureFlowState, gesture: GestureName) {
   return getAllowedGestures(state).includes(gesture);
+}
+
+function isIntroLocked(phase: IntroPhase) {
+  return phase === "video-prelude" || phase === "photo-wall-enter" || phase === "wall-to-tree";
+}
+
+function shouldReduceMotion() {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 }
 
 function getActionCooldowns(lastEmit: Record<GestureName, number>, now: number): Record<GestureName, number> {
