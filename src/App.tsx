@@ -58,6 +58,7 @@ const INITIAL_ACTION_COOLDOWNS: Record<GestureName, number> = {
 function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const burstTimerRef = useRef<number | null>(null);
+  const introAudioEnergyRef = useRef(0);
   const actionLastRef = useRef<Record<GestureName, number>>({ ...INITIAL_ACTION_COOLDOWNS });
   const globalActionLastRef = useRef(0);
   const [photos, setPhotos] = useState<PhotoAsset[]>([]);
@@ -449,6 +450,7 @@ function App() {
         transitionDirection={transitionDirection}
         introPhase={introPhase}
         introSpeed={INTRO_SPEED}
+        introAudioEnergyRef={introAudioEnergyRef}
         onIntroPhaseComplete={handleIntroPhaseComplete}
         onIntroError={handleIntroSceneError}
       />
@@ -459,6 +461,7 @@ function App() {
         stopKey={introMediaStopKey}
         videoSrc={INTRO_VIDEO_SRC}
         audioSrc={INTRO_AUDIO_SRC}
+        audioEnergyRef={introAudioEnergyRef}
         onVideoEnded={handleIntroVideoEnded}
         onVideoError={handleIntroVideoError}
         onAudioError={handleIntroAudioError}

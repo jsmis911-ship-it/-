@@ -1,6 +1,13 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type MutableRefObject } from "react";
 import * as THREE from "three";
 import type { IntroPhase, PhotoAsset, SceneMode } from "../types";
+import {
+  createCoupleKissParticleSystem,
+  disposeCoupleKissParticleSystem,
+  resizeCoupleKissParticleSystem,
+  updateCoupleKissParticleSystem,
+  type CoupleKissParticleSystem,
+} from "./coupleKissParticles";
 
 type NebulaSakuraSceneProps = {
   photos: PhotoAsset[];
@@ -10,6 +17,7 @@ type NebulaSakuraSceneProps = {
   transitionDirection: -1 | 0 | 1;
   introPhase: IntroPhase;
   introSpeed: number;
+  introAudioEnergyRef?: MutableRefObject<number>;
   onIntroPhaseComplete: (phase: IntroPhase) => void;
   onIntroError: () => void;
 };
@@ -17,7 +25,7 @@ type NebulaSakuraSceneProps = {
 type PhotoEntry = {
   id: string;
   group: THREE.Group;
-  material: THREE.MeshBasicMaterial;
+  material: THREE.ShaderMaterial;
   glowMaterial: THREE.MeshBasicMaterial;
   texture: THREE.Texture;
   blurredTexture: THREE.Texture;
@@ -28,7 +36,11 @@ type PhotoEntry = {
   burst: THREE.Vector3;
   gallery: THREE.Vector3;
   wallScatter: THREE.Vector3;
+  wallRushControl: THREE.Vector3;
   wallSlot: THREE.Vector3;
+  wallScale: number;
+  wallFloat: THREE.Vector3;
+  wallRotation: THREE.Vector3;
   wallShardSeed: number;
   seed: number;
 };
@@ -93,6 +105,7 @@ type ParticleLayers = {
   groundPetals: DecorativeParticleLayer;
   petalRain: PetalRainLayer;
   treeGlow: GlowParticleLayer;
+  coupleKiss: CoupleKissParticleSystem;
 };
 
 type TreeParticleKind = "trunk" | "branch" | "canopy";
@@ -194,12 +207,32 @@ const SAKURA_RAIN_CONFIG = {
 
 const INTRO_TIMING = {
   speedAnchor: 5.69,
-  wallBaseMs: 4200,
-  wallMinMs: 2380,
-  morphBaseMs: 5200,
+  wallBaseMs: 2860,
+  wallMinMs: 2480,
+  morphBaseMs: 3180,
   morphMinMs: 2860,
   wallSettleMs: 360,
   morphSettleMs: 260,
+};
+
+const PHOTO_RUSH_CONFIG = {
+  cameraZ: 19.2,
+  wallLookZ: -1.1,
+  deepZMin: -76,
+  deepZMax: -34,
+  nearZMin: 4.2,
+  nearZMax: 7.2,
+  farPlaneMargin: 1.18,
+  nearPlaneMargin: 0.92,
+  wallCoverageX: 0.86,
+  wallCoverageY: 0.76,
+  smallSetCoverageX: 0.78,
+  smallSetCoverageY: 0.7,
+  floatAmplitude: 0.15,
+  floatDepthAmplitude: 0.24,
+  maxRotation: THREE.MathUtils.degToRad(15),
+  spawnDelayMinMs: 20,
+  spawnDelayMaxMs: 380,
 };
 
 const PHOTO_SHARD_CONFIG = {
@@ -233,6 +266,7 @@ export function NebulaSakuraScene({
   transitionDirection,
   introPhase,
   introSpeed,
+  introAudioEnergyRef,
   onIntroPhaseComplete,
   onIntroError,
 }: NebulaSakuraSceneProps) {
@@ -299,7 +333,7 @@ export function NebulaSakuraScene({
     }
 
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 90);
+    const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 240);
     camera.position.set(0, 0.2, 18);
 
     const renderer = new THREE.WebGLRenderer({
@@ -325,7 +359,7 @@ export function NebulaSakuraScene({
 
     const layers = createParticleLayers();
     layersRef.current = layers;
-    scene.add(layers.treeCore.points, layers.treeGlow.points, layers.ambient.points, layers.groundPetals.points, layers.petalRain.mesh);
+    scene.add(layers.treeCore.points, layers.treeGlow.points, layers.ambient.points, layers.groundPetals.points, layers.petalRain.mesh, layers.coupleKiss.points);
 
     sceneRef.current = scene;
     cameraRef.current = camera;
@@ -336,6 +370,7 @@ export function NebulaSakuraScene({
       camera.aspect = Math.max(0.1, rect.width / Math.max(1, rect.height));
       camera.updateProjectionMatrix();
       renderer.setSize(rect.width, rect.height, false);
+      resizeCoupleKissParticleSystem(layers.coupleKiss, camera.aspect, renderer.getPixelRatio());
     };
 
     resize();
@@ -346,8 +381,9 @@ export function NebulaSakuraScene({
       const activeIntroPhase = introPhaseRef.current;
       const activeIntroStarted = introStartedRef.current;
       const activeIntroSpeed = introSpeedRef.current;
+      const activeAudioEnergy = introAudioEnergyRef?.current ?? 0;
       updateParticleLayers(layersRef.current, modeRef.current, time, modeStartedRef.current, activeIntroPhase, activeIntroStarted, activeIntroSpeed);
-      updatePhotoShardLayer(photoShardLayerRef.current, activeIntroPhase, time, activeIntroStarted, activeIntroSpeed);
+      updatePhotoShardLayer(photoShardLayerRef.current, activeIntroPhase, time, activeIntroStarted, activeIntroSpeed, activeAudioEnergy);
       updatePhotos(
         photoEntriesRef.current,
         modeRef.current,
@@ -359,8 +395,9 @@ export function NebulaSakuraScene({
         activeIntroPhase,
         activeIntroStarted,
         activeIntroSpeed,
+        activeAudioEnergy,
       );
-      updateSceneCamera(camera, modeRef.current, time, modeStartedRef.current, activeIntroPhase, activeIntroStarted, activeIntroSpeed);
+      updateSceneCamera(camera, modeRef.current, time, modeStartedRef.current, activeIntroPhase, activeIntroStarted, activeIntroSpeed, activeAudioEnergy);
       completeIntroPhaseIfReady(activeIntroPhase, time, activeIntroStarted, activeIntroSpeed, completedIntroPhaseRef, onIntroPhaseCompleteRef);
 
       renderer.render(scene, camera);
@@ -450,6 +487,7 @@ function updatePhotos(
   introPhase: IntroPhase,
   introStarted: number,
   introSpeed: number,
+  audioEnergy: number,
 ) {
   const target = new THREE.Vector3();
   const targetScale = new THREE.Vector3();
@@ -460,6 +498,7 @@ function updatePhotos(
   const burstPhase = clamp(elapsed / 3000, 0, 1);
   const transitionPhase = clamp((time - transitionStarted) / 850, 0, 1);
   const centerEase = easeOutCubic(transitionPhase);
+  const beat = clamp(audioEnergy, 0, 1);
 
   entries.forEach((entry, index) => {
     const wave = Math.sin(time * 0.00065 + entry.seed * 9.1);
@@ -467,36 +506,52 @@ function updatePhotos(
     let opacity = 0.55;
     let glow = 0.26;
     let scale = 1;
-    let desiredTexture = entry.texture;
+    let blurMix = 0.12;
+    let dim = 1;
+    let introLocal = 1;
+    let introSettle = 1;
+    let wallLock = 1;
 
     if (introPhase === "photo-wall-enter") {
       const delay = getIntroEntryDelay(entry, index, introSpeed);
-      const local = clamp((introElapsed - delay) / (wallDuration * 0.72), 0, 1);
-      const eased = easeOutBack(local);
-      const settle = easeInOutCubic(clamp((introElapsed - wallDuration * 0.68) / (wallDuration * 0.32), 0, 1));
-      const jitter = 1 - settle;
-      desiredTexture = local > 0.38 ? entry.texture : entry.blurredTexture;
-      target.copy(entry.wallScatter).lerp(entry.wallSlot, eased);
-      target.x += Math.sin(local * Math.PI * 3.1 + entry.seed * 12) * jitter * 0.38;
-      target.y += Math.cos(local * Math.PI * 2.4 + entry.seed * 9) * jitter * 0.24;
-      target.z += Math.sin(local * Math.PI + entry.seed * 4) * (1 - local) * 1.15;
-      scale = lerp(0.34 + entry.seed * 0.34, 0.78, easeOutCubic(local));
-      opacity = 0.04 + easeOutCubic(local) * 0.88;
-      glow = 0.1 + easeOutCubic(local) * 0.38;
+      introLocal = clamp((introElapsed - delay) / (wallDuration * 0.78), 0, 1);
+      const rush = easeOutExpo(introLocal);
+      introSettle = easeInOutCubic(clamp((introLocal - 0.66) / 0.34, 0, 1));
+      wallLock = easeInOutCubic(clamp((introLocal - 0.78) / 0.22, 0, 1));
+      const visibility = smoothstep(0.02, 0.22, introLocal);
+      const nearPass = Math.sin(clamp(introLocal / 0.74, 0, 1) * Math.PI);
+      const floatMix = smoothstep(0.28, 1, introLocal) * (1 - wallLock * 0.94);
+      const beatPulse = beat * (1 - wallLock) * 0.45;
+      const turbulence = (1 - introSettle) * (0.34 + beatPulse * 0.18);
+      const path = quadraticBezier(entry.wallScatter, entry.wallRushControl, entry.wallSlot, rush);
+
+      target.copy(path);
+      target.x += Math.sin(time * 0.00118 + entry.wallShardSeed * 25 + introLocal * 5.2) * entry.wallFloat.x * (0.35 + floatMix);
+      target.y += Math.cos(time * 0.00104 + entry.wallShardSeed * 21 + introLocal * 4.4) * entry.wallFloat.y * (0.35 + floatMix);
+      target.z += Math.sin(time * 0.00086 + entry.wallShardSeed * 17) * entry.wallFloat.z * floatMix;
+      target.x += Math.sin(introLocal * Math.PI * 4.2 + entry.seed * 18) * turbulence;
+      target.y += Math.cos(introLocal * Math.PI * 3.4 + entry.seed * 14) * turbulence * 0.72;
+      target.z += nearPass * (0.28 + entry.seed * 0.22) * (1 - wallLock);
+      target.lerp(entry.wallSlot, wallLock);
+
+      blurMix = getDepthOfFieldBlur(target.z);
+      dim = lerp(0.72, 1.06, smoothstep(0.08, 0.46, introLocal)) - blurMix * 0.12;
+      scale = lerp(0.18 + entry.seed * 0.12, entry.wallScale, easeOutCubic(introLocal)) + nearPass * (1 - wallLock) * 0.16 + beatPulse * 0.05;
+      opacity = visibility * lerp(0.76, 0.96, smoothstep(0.18, 0.62, introLocal)) * (1 - blurMix * 0.16);
+      glow = visibility * (0.16 + nearPass * (1 - wallLock) * 0.32 + beatPulse * 0.12 + introSettle * 0.16);
     } else if (introPhase === "wall-to-tree") {
       const phase = clamp(introElapsed / morphDuration, 0, 1);
       const fold = easeInOutCubic(phase);
-      const inhale = Math.sin(clamp(phase / 0.34, 0, 1) * Math.PI) * 0.52;
-      desiredTexture = entry.texture;
-      target.copy(entry.wallSlot).multiplyScalar(1 - inhale * 0.12).lerp(entry.tree, fold);
-      target.x += wave * (0.16 + fold * 0.08);
-      target.y += drift * (0.12 + fold * 0.05);
+      target.copy(entry.wallSlot).lerp(entry.tree, fold);
+      target.x += wave * lerp(0.035, 0.24, fold);
+      target.y += drift * lerp(0.03, 0.17, fold);
       target.z += Math.sin(time * 0.0007 + entry.seed) * lerp(0.08, 0.18, fold);
-      scale = lerp(0.78, 0.52 + (entry.seed % 0.18), fold);
+      scale = lerp(entry.wallScale, 0.52 + (entry.seed % 0.18), fold);
       opacity = 0.92 - fold * 0.06;
       glow = 0.48 + fold * 0.04;
+      blurMix = lerp(0.08, 0.02, fold);
+      dim = 1.02;
     } else if (mode === "idle") {
-      desiredTexture = entry.blurredTexture;
       target.copy(entry.idle);
       target.x += drift * 0.24;
       target.y += wave * 0.2;
@@ -504,6 +559,8 @@ function updatePhotos(
       scale = 0.66 + entry.seed * 0.2;
       opacity = 0.5;
       glow = 0.13;
+      blurMix = 0.82;
+      dim = 0.88;
     } else if (mode === "tree") {
       target.copy(entry.tree);
       target.x += wave * 0.12;
@@ -512,6 +569,7 @@ function updatePhotos(
       scale = 0.52 + (entry.seed % 0.18);
       opacity = 0.86;
       glow = 0.46;
+      blurMix = 0.04;
     } else if (mode === "burst") {
       if (burstPhase < 0.56) {
         target.copy(entry.sphere);
@@ -521,6 +579,7 @@ function updatePhotos(
         scale = 0.34 + burstPhase * 0.32;
         opacity = 0.92;
         glow = 0.55;
+        blurMix = 0.08;
       } else {
         const t = easeOutCubic((burstPhase - 0.56) / 0.44);
         const handoff = index === selectedIndex ? easeInOutCubic(clamp((burstPhase - 0.66) / 0.34, 0, 1)) : 0;
@@ -532,6 +591,7 @@ function updatePhotos(
           scale = 0.58 + t * 0.22 + handoff * 0.92;
           opacity = 0.82;
           glow = 0.54 + handoff * 0.12;
+          blurMix = lerp(0.1, 0, handoff);
         } else {
           target.copy(entry.sphere).lerp(entry.burst, t * 0.52);
           target.x += 0.52 + Math.sin(time * 0.002 + entry.seed * 5) * 0.28 + t * (1.8 + entry.seed * 1.7);
@@ -539,6 +599,7 @@ function updatePhotos(
           scale = 0.58 + t * 0.16;
           opacity = 0.76 - t * 0.3;
           glow = 0.5 - t * 0.26;
+          blurMix = 0.22 + t * 0.38;
         }
       }
     } else if (mode === "viewer") {
@@ -547,6 +608,7 @@ function updatePhotos(
         scale = 1.8;
         opacity = 0.34;
         glow = 0.58;
+        blurMix = 0.02;
       } else {
         target.copy(entry.idle);
         target.x += Math.sign(entry.idle.x || 1) * 2.2 + drift * 0.35;
@@ -554,6 +616,8 @@ function updatePhotos(
         scale = 0.68;
         opacity = 0.26;
         glow = 0.11;
+        blurMix = 0.72;
+        dim = 0.82;
       }
     } else {
       target.copy(entry.gallery);
@@ -562,32 +626,38 @@ function updatePhotos(
       scale = 0.62;
       opacity = index === selectedIndex ? 0.9 : 0.7;
       glow = index === selectedIndex ? 0.52 : 0.24;
+      blurMix = index === selectedIndex ? 0.04 : 0.18;
     }
 
-    if (entry.material.map !== desiredTexture) {
-      entry.material.map = desiredTexture;
-      entry.material.needsUpdate = true;
-    }
-
-    entry.group.position.lerp(target, 0.055);
+    const positionMix = introPhase === "photo-wall-enter" ? lerp(0.16, 0.34, wallLock) : introPhase === "wall-to-tree" ? 0.072 : 0.055;
+    entry.group.position.lerp(target, positionMix);
     targetScale.set(scale, scale, scale);
-    entry.group.scale.lerp(targetScale, 0.06);
+    entry.group.scale.lerp(targetScale, introPhase === "photo-wall-enter" ? lerp(0.11, 0.28, wallLock) : introPhase === "wall-to-tree" ? 0.08 : 0.06);
 
     const introWallActive = introPhase === "photo-wall-enter" || introPhase === "wall-to-tree";
+    const rushRotation = introPhase === "photo-wall-enter" ? 1 - wallLock : 0;
+    const floatRotation = introWallActive
+      ? Math.sin(time * 0.00052 + entry.wallShardSeed * 8) * 0.035 * (1 - wallLock)
+      : Math.sin(time * 0.00042 + entry.seed * 6) * 0.28;
     const targetRotY = mode === "viewer" && index === selectedIndex
       ? 0
       : introWallActive
-        ? Math.sin(time * 0.00038 + entry.wallShardSeed * 6) * 0.1
-        : Math.sin(time * 0.00042 + entry.seed * 6) * 0.28;
-    const targetRotX = mode === "tree" || introPhase === "wall-to-tree" ? Math.sin(time * 0.00052 + entry.seed) * 0.08 : Math.cos(time * 0.00034 + entry.seed) * 0.12;
-    entry.group.rotation.y += (targetRotY - entry.group.rotation.y) * 0.055;
-    entry.group.rotation.x += (targetRotX - entry.group.rotation.x) * 0.055;
+        ? entry.wallRotation.y * rushRotation + floatRotation
+        : floatRotation;
+    const targetRotX = mode === "tree" || introPhase === "wall-to-tree"
+      ? Math.sin(time * 0.00052 + entry.seed) * 0.08
+      : entry.wallRotation.x * rushRotation + Math.cos(time * 0.00034 + entry.seed) * 0.08 * (1 - wallLock);
     const targetRotZ = introPhase === "photo-wall-enter"
-      ? Math.sin((1 - clamp((introElapsed - getIntroEntryDelay(entry, index, introSpeed)) / (wallDuration * 0.72), 0, 1)) * Math.PI + entry.seed * 5) * 0.16
+      ? entry.wallRotation.z * rushRotation + Math.sin(time * 0.0007 + entry.seed * 7) * 0.045 * (1 - wallLock)
       : Math.sin(time * 0.00033 + entry.seed * 7) * 0.04;
-    entry.group.rotation.z += (targetRotZ - entry.group.rotation.z) * 0.04;
+    entry.group.rotation.y += (targetRotY - entry.group.rotation.y) * 0.06;
+    entry.group.rotation.x += (targetRotX - entry.group.rotation.x) * 0.06;
+    entry.group.rotation.z += (targetRotZ - entry.group.rotation.z) * 0.052;
 
-    entry.material.opacity += (opacity - entry.material.opacity) * 0.08;
+    const uniforms = entry.material.uniforms;
+    uniforms.uOpacity.value += (opacity - uniforms.uOpacity.value) * 0.1;
+    uniforms.uBlurMix.value += (clamp(blurMix, 0, 1) - uniforms.uBlurMix.value) * 0.12;
+    uniforms.uDim.value += (clamp(dim, 0.45, 1.12) - uniforms.uDim.value) * 0.08;
     entry.glowMaterial.opacity += (glow - entry.glowMaterial.opacity) * 0.08;
   });
 }
@@ -610,9 +680,24 @@ function updateParticleLayers(
   updateAmbientLayer(layers.ambient, mode, time, introPhase);
   updateGroundPetalLayer(layers.groundPetals, mode, time, introPhase);
   updatePetalRainLayer(layers.petalRain, mode, time, modeStarted);
+  updateCoupleKissParticleSystem(layers.coupleKiss, {
+    mode,
+    introPhase,
+    time,
+    treeFormationProgress: introPhase === "wall-to-tree"
+      ? easeInOutCubic(clamp((time - introStarted) / getIntroDuration("wall-to-tree", introSpeed), 0, 1))
+      : mode === "tree" ? 1 : 0,
+  });
 }
 
-function updatePhotoShardLayer(layer: PhotoShardLayer | null, introPhase: IntroPhase, time: number, introStarted: number, introSpeed: number) {
+function updatePhotoShardLayer(
+  layer: PhotoShardLayer | null,
+  introPhase: IntroPhase,
+  time: number,
+  introStarted: number,
+  introSpeed: number,
+  audioEnergy: number,
+) {
   if (!layer) {
     return;
   }
@@ -622,6 +707,7 @@ function updatePhotoShardLayer(layer: PhotoShardLayer | null, introPhase: IntroP
   const elapsed = time - introStarted;
   const wallDuration = getIntroDuration("photo-wall-enter", introSpeed);
   const morphDuration = getIntroDuration("wall-to-tree", introSpeed);
+  const beat = clamp(audioEnergy, 0, 1);
   let targetOpacity = 0;
 
   for (let i = 0; i < layer.seeds.length; i += 1) {
@@ -631,13 +717,17 @@ function updatePhotoShardLayer(layer: PhotoShardLayer | null, introPhase: IntroP
     let local = 0;
 
     if (introPhase === "photo-wall-enter") {
-      const delay = (40 + hash01(i * 17 + 3) * 280) / Math.max(1, introSpeed / INTRO_TIMING.speedAnchor);
-      local = clamp((elapsed - delay) / (wallDuration * 0.68), 0, 1);
-      const drift = 1 - easeInOutCubic(clamp((elapsed - wallDuration * 0.68) / (wallDuration * 0.32), 0, 1));
-      target.lerp(new THREE.Vector3(layer.wall[offset], layer.wall[offset + 1], layer.wall[offset + 2]), easeOutCubic(local));
-      target.x += Math.sin(time * 0.0012 + seed * 22) * 0.16 * drift;
-      target.y += Math.cos(time * 0.001 + seed * 19) * 0.12 * drift;
-      targetOpacity = PHOTO_SHARD_CONFIG.wallOpacity;
+      const delay = (PHOTO_RUSH_CONFIG.spawnDelayMinMs + hash01(i * 17 + 3) * 320) * getIntroTempoScale(introSpeed);
+      local = clamp((elapsed - delay) / (wallDuration * 0.74), 0, 1);
+      const flow = easeOutExpo(local);
+      const lock = easeInOutCubic(clamp((local - 0.78) / 0.22, 0, 1));
+      const drift = 1 - easeInOutCubic(clamp((local - 0.68) / 0.32, 0, 1));
+      target.lerp(new THREE.Vector3(layer.wall[offset], layer.wall[offset + 1], layer.wall[offset + 2]), flow);
+      target.x += Math.sin(time * 0.00145 + seed * 22 + local * 4.2) * 0.24 * drift * (1 - lock);
+      target.y += Math.cos(time * 0.0012 + seed * 19 + local * 3.6) * 0.18 * drift * (1 - lock);
+      target.z += Math.sin(time * 0.001 + seed * 25) * 0.34 * drift * (1 - lock);
+      target.lerp(new THREE.Vector3(layer.wall[offset], layer.wall[offset + 1], layer.wall[offset + 2]), lock);
+      targetOpacity = PHOTO_SHARD_CONFIG.wallOpacity * (0.84 + beat * (1 - lock) * 0.16);
     } else if (introPhase === "wall-to-tree") {
       local = clamp(elapsed / morphDuration, 0, 1);
       const flow = easeInOutCubic(local);
@@ -649,12 +739,13 @@ function updatePhotoShardLayer(layer: PhotoShardLayer | null, introPhase: IntroP
       targetOpacity = PHOTO_SHARD_CONFIG.morphOpacity * (1 - clamp((local - 0.82) / 0.18, 0, 1) * 0.55);
     }
 
-    layer.current[offset] += (target.x - layer.current[offset]) * 0.09;
-    layer.current[offset + 1] += (target.y - layer.current[offset + 1]) * 0.09;
-    layer.current[offset + 2] += (target.z - layer.current[offset + 2]) * 0.09;
+    const convergeMix = introPhase === "photo-wall-enter" && local > 0.78 ? 0.2 : 0.09;
+    layer.current[offset] += (target.x - layer.current[offset]) * convergeMix;
+    layer.current[offset + 1] += (target.y - layer.current[offset + 1]) * convergeMix;
+    layer.current[offset + 2] += (target.z - layer.current[offset + 2]) * convergeMix;
 
     if (sizes) {
-      const size = layer.sizes[i] * (0.55 + easeOutCubic(local) * 0.7);
+      const size = layer.sizes[i] * (0.55 + easeOutCubic(local) * 0.7 + beat * (1 - smoothstep(0.78, 1, local)) * 0.1);
       sizes.setX(i, size);
     }
   }
@@ -902,14 +993,17 @@ function updateSceneCamera(
   introPhase: IntroPhase,
   introStarted: number,
   introSpeed: number,
+  audioEnergy: number,
 ) {
   if (introPhase === "photo-wall-enter") {
     const elapsed = time - introStarted;
-    const introPulse = Math.sin(elapsed * 0.0018) * 0.08;
+    const phase = easeOutCubic(clamp(elapsed / getIntroDuration("photo-wall-enter", introSpeed), 0, 1));
+    const beat = clamp(audioEnergy, 0, 1);
+    const introPulse = Math.sin(elapsed * 0.0018) * (0.12 + beat * 0.18);
     camera.position.x += (introPulse - camera.position.x) * 0.032;
-    camera.position.y += (0.08 - camera.position.y) * 0.032;
-    camera.position.z += (13.8 - camera.position.z) * 0.032;
-    camera.lookAt(0, 0.12, -1.2);
+    camera.position.y += (lerp(0.02, 0.16, phase) - camera.position.y) * 0.032;
+    camera.position.z += (PHOTO_RUSH_CONFIG.cameraZ - camera.position.z) * 0.032;
+    camera.lookAt(0, lerp(0.02, 0.16, phase), PHOTO_RUSH_CONFIG.wallLookZ);
     return;
   }
 
@@ -919,7 +1013,7 @@ function updateSceneCamera(
     const orbit = Math.sin(time * TREE_SHAPE_CONFIG.treeRotationSpeed) * TREE_SHAPE_CONFIG.treeRotationAmplitude * phase;
     const targetX = lerp(0, Math.sin(orbit) * TREE_SHAPE_CONFIG.cameraOrbitRadius, phase);
     const targetY = lerp(0.08, 0.42 + Math.sin(time * 0.00022) * 0.12, phase);
-    const targetZ = lerp(13.8, 18 - (1 - Math.cos(orbit)) * TREE_SHAPE_CONFIG.cameraOrbitDepth, phase);
+    const targetZ = lerp(PHOTO_RUSH_CONFIG.cameraZ, 18 - (1 - Math.cos(orbit)) * TREE_SHAPE_CONFIG.cameraOrbitDepth, phase);
     camera.position.x += (targetX - camera.position.x) * 0.026;
     camera.position.y += (targetY - camera.position.y) * 0.026;
     camera.position.z += (targetZ - camera.position.z) * 0.026;
@@ -994,12 +1088,7 @@ async function createPhotoEntry(photo: PhotoAsset, index: number, total: number)
     depthWrite: false,
     blending: THREE.AdditiveBlending,
   });
-  const material = new THREE.MeshBasicMaterial({
-    map: blurredTexture,
-    transparent: true,
-    opacity: 0.42,
-    depthWrite: false,
-  });
+  const material = createPhotoMaterial(texture, blurredTexture, 0.42);
   const glowMesh = new THREE.Mesh(glowGeometry, glowMaterial);
   glowMesh.position.z = -0.04;
   const photoMesh = new THREE.Mesh(geometry, material);
@@ -1011,8 +1100,23 @@ async function createPhotoEntry(photo: PhotoAsset, index: number, total: number)
   const sphere = buildSpherePosition(index, total, 2.35);
   const burst = idle.clone().multiplyScalar(1.12);
   const gallery = buildGalleryPosition(index, total);
-  const wallSlot = buildPhotoWallSlotPosition(index, total, aspect);
+  const wallLayout = buildAdaptivePhotoWallLayout(index, total, aspect);
+  const wallSlot = wallLayout.position;
+  const wallScale = wallLayout.scale;
   const wallScatter = buildPhotoWallScatterPosition(index, total, wallSlot);
+  const wallRushControl = buildPhotoWallRushControlPosition(index, total, wallScatter, wallSlot);
+  const wallRushNear = buildPhotoWallNearPosition(index, total, wallSlot);
+  wallRushControl.lerp(wallRushNear, 0.42);
+  const wallFloat = new THREE.Vector3(
+    PHOTO_RUSH_CONFIG.floatAmplitude * (0.75 + hash01(index * 173 + 7) * 0.9),
+    PHOTO_RUSH_CONFIG.floatAmplitude * (0.6 + hash01(index * 179 + 11) * 0.82),
+    PHOTO_RUSH_CONFIG.floatDepthAmplitude * (0.55 + hash01(index * 181 + 13) * 0.9),
+  );
+  const wallRotation = new THREE.Vector3(
+    (hash01(index * 191 + 17) - 0.5) * PHOTO_RUSH_CONFIG.maxRotation * 2,
+    (hash01(index * 193 + 19) - 0.5) * PHOTO_RUSH_CONFIG.maxRotation * 2,
+    (hash01(index * 197 + 23) - 0.5) * PHOTO_RUSH_CONFIG.maxRotation * 2,
+  );
   const wallShardSeed = hash01(index * 97 + total * 13);
   group.position.copy(idle);
   group.scale.setScalar(0.64 + seed * 0.16);
@@ -1031,7 +1135,11 @@ async function createPhotoEntry(photo: PhotoAsset, index: number, total: number)
     burst,
     gallery,
     wallScatter,
+    wallRushControl,
     wallSlot,
+    wallScale,
+    wallFloat,
+    wallRotation,
     wallShardSeed,
     seed,
   };
@@ -1052,18 +1160,19 @@ async function createPhotoShardLayer(photos: PhotoAsset[], entries: PhotoEntry[]
     const entry = entries[i % entries.length];
     const seed = hash01(i * 97 + entry.wallShardSeed * 113);
     const offset = i * 3;
-    const localX = (hash01(i * 101 + 3) - 0.5) * PHOTO_HEIGHT * entry.aspect * 0.86;
-    const localY = (hash01(i * 103 + 5) - 0.5) * PHOTO_HEIGHT * 0.86;
+    const localX = (hash01(i * 101 + 3) - 0.5) * PHOTO_HEIGHT * entry.aspect * entry.wallScale * 0.86;
+    const localY = (hash01(i * 103 + 5) - 0.5) * PHOTO_HEIGHT * entry.wallScale * 0.86;
     const localZ = (hash01(i * 107 + 7) - 0.5) * 0.16;
     const wallPos = new THREE.Vector3(
       entry.wallSlot.x + localX,
       entry.wallSlot.y + localY,
       entry.wallSlot.z + localZ,
     );
-    const scatterPos = wallPos.clone().lerp(entry.wallScatter, 0.54 + seed * 0.32);
-    scatterPos.x += (hash01(i * 109 + 11) - 0.5) * 2.2;
-    scatterPos.y += (hash01(i * 113 + 13) - 0.5) * 1.8;
-    scatterPos.z -= 1.2 + hash01(i * 127 + 17) * 3.4;
+    const scatterPos = wallPos.clone().lerp(entry.wallScatter, 0.72 + seed * 0.24);
+    const deepBounds = getVisibleBoundsAtZ(scatterPos.z, PHOTO_RUSH_CONFIG.cameraZ, getViewportAspect());
+    scatterPos.x += (hash01(i * 109 + 11) - 0.5) * deepBounds.halfWidth * 0.28;
+    scatterPos.y += (hash01(i * 113 + 13) - 0.5) * deepBounds.halfHeight * 0.28;
+    scatterPos.z -= 2.2 + hash01(i * 127 + 17) * 8.6;
 
     const treeSample = buildTreeParticle(i + 29000, count + 29000, seed);
     const treePos = treeSample.position.clone();
@@ -1110,6 +1219,7 @@ function createParticleLayers(): ParticleLayers {
     ambient: createAmbientLayer(TREE_SHAPE_CONFIG.ambientParticleCount),
     groundPetals: createGroundPetalLayer(TREE_SHAPE_CONFIG.groundPetalParticleCount),
     petalRain: createPetalRainLayer(SAKURA_RAIN_CONFIG.particleCount),
+    coupleKiss: createCoupleKissParticleSystem(),
   };
 }
 
@@ -1341,35 +1451,134 @@ function buildIdlePosition(index: number, total: number) {
   );
 }
 
-function buildPhotoWallSlotPosition(index: number, total: number, aspect: number) {
-  const columns = Math.min(8, Math.max(2, Math.ceil(Math.sqrt(total * 1.62))));
-  const rows = Math.ceil(total / columns);
-  const col = index % columns;
-  const row = Math.floor(index / columns);
-  const compact = total > 20;
-  const xSpacing = compact ? 1.52 : 1.72;
-  const ySpacing = compact ? 1.08 : 1.22;
-  const edgeOffset = (hash01(index * 31 + total) - 0.5) * (compact ? 0.1 : 0.16);
-  const aspectNudge = (aspect - 1) * 0.18;
-  return new THREE.Vector3(
-    (col - (columns - 1) / 2) * xSpacing + edgeOffset + aspectNudge,
-    ((rows - 1) / 2 - row) * ySpacing + (hash01(index * 37 + 9) - 0.5) * 0.12,
-    -1.3 + (hash01(index * 41 + 11) - 0.5) * 0.42 + row * 0.025,
+function buildAdaptivePhotoWallLayout(index: number, total: number, aspect: number) {
+  const viewportAspect = getViewportAspect();
+  const bounds = getVisibleBoundsAtZ(PHOTO_RUSH_CONFIG.wallLookZ, PHOTO_RUSH_CONFIG.cameraZ, viewportAspect);
+  const coverageX = total <= 4 ? PHOTO_RUSH_CONFIG.smallSetCoverageX : PHOTO_RUSH_CONFIG.wallCoverageX;
+  const coverageY = total <= 4 ? PHOTO_RUSH_CONFIG.smallSetCoverageY : PHOTO_RUSH_CONFIG.wallCoverageY;
+  const wallWidth = bounds.halfWidth * 2 * coverageX;
+  const wallHeight = bounds.halfHeight * 2 * coverageY;
+
+  if (total <= 4) {
+    return buildSmallPhotoWallLayout(index, total, aspect, wallWidth, wallHeight);
+  }
+
+  const grid = choosePhotoWallGrid(total, wallWidth / Math.max(0.001, wallHeight));
+  const row = Math.floor(index / grid.columns);
+  const col = index % grid.columns;
+  const rowCount = row === grid.rows - 1 ? total - row * grid.columns || grid.columns : grid.columns;
+  const centeredCol = rowCount < grid.columns ? col + (grid.columns - rowCount) / 2 : col;
+  const cellWidth = wallWidth / grid.columns;
+  const cellHeight = wallHeight / grid.rows;
+  const jitterStrength = total > 24 ? 0.035 : total > 12 ? 0.055 : 0.075;
+  const xJitter = (hash01(index * 31 + total) - 0.5) * cellWidth * jitterStrength;
+  const yJitter = (hash01(index * 37 + 9) - 0.5) * cellHeight * jitterStrength;
+  const spreadX = grid.columns > 1 ? wallWidth / (grid.columns - 1) : 0;
+  const spreadY = grid.rows > 1 ? wallHeight / (grid.rows - 1) : 0;
+  const twoRowInset = grid.rows === 2 ? 0.74 : 1;
+  const scaleFill = total > 24 ? 0.66 : total > 16 ? 0.7 : total > 8 ? 0.74 : 0.78;
+  const scale = clamp(
+    Math.min(cellWidth / (PHOTO_HEIGHT * aspect), cellHeight / PHOTO_HEIGHT) * scaleFill,
+    total > 24 ? 1.18 : total > 16 ? 1.3 : 1.5,
+    total > 24 ? 1.95 : total > 16 ? 2.2 : 2.65,
   );
+
+  return {
+    position: new THREE.Vector3(
+      (centeredCol - (grid.columns - 1) / 2) * spreadX + xJitter + (aspect - 1) * 0.08,
+      ((grid.rows - 1) / 2 - row) * spreadY * twoRowInset + yJitter,
+      PHOTO_RUSH_CONFIG.wallLookZ + (hash01(index * 41 + 11) - 0.5) * 0.34 + row * 0.018,
+    ),
+    scale,
+  };
+}
+
+function buildSmallPhotoWallLayout(index: number, total: number, aspect: number, wallWidth: number, wallHeight: number) {
+  const layouts: Record<number, Array<[number, number]>> = {
+    1: [[0, 0]],
+    2: [[-0.28, 0.08], [0.28, -0.08]],
+    3: [[-0.34, -0.18], [0, 0.24], [0.34, -0.2]],
+    4: [[-0.32, 0.23], [0.32, 0.18], [-0.3, -0.22], [0.3, -0.25]],
+  };
+  const [nx, ny] = layouts[Math.max(1, Math.min(4, total))][index] ?? [0, 0];
+  const scaleTarget = total === 1
+    ? Math.min(wallWidth / (PHOTO_HEIGHT * aspect) * 0.26, wallHeight / PHOTO_HEIGHT * 0.32)
+    : total === 2
+      ? Math.min(wallWidth / (PHOTO_HEIGHT * aspect) * 0.22, wallHeight / PHOTO_HEIGHT * 0.34)
+      : Math.min(wallWidth / (PHOTO_HEIGHT * aspect) * 0.18, wallHeight / PHOTO_HEIGHT * 0.28);
+  return {
+    position: new THREE.Vector3(
+      nx * wallWidth + (hash01(index * 31 + total) - 0.5) * wallWidth * 0.018,
+      ny * wallHeight + (hash01(index * 37 + total) - 0.5) * wallHeight * 0.018,
+      PHOTO_RUSH_CONFIG.wallLookZ + (hash01(index * 41 + 11) - 0.5) * 0.24,
+    ),
+    scale: clamp(scaleTarget, total === 1 ? 2.15 : 1.72, total === 1 ? 4.1 : total === 2 ? 3.45 : 2.95),
+  };
+}
+
+function choosePhotoWallGrid(total: number, wallAspect: number) {
+  let best = { columns: Math.min(8, total), rows: Math.ceil(total / Math.min(8, total)), score: Number.POSITIVE_INFINITY };
+  const maxColumns = Math.min(8, total);
+  for (let columns = 2; columns <= maxColumns; columns += 1) {
+    const rows = Math.ceil(total / columns);
+    const empty = columns * rows - total;
+    const gridAspect = columns / rows;
+    const aspectScore = Math.abs(Math.log(gridAspect / Math.max(0.001, wallAspect)));
+    const emptyScore = empty * 0.08;
+    const densityScore = total > 18 && columns < 6 ? 0.3 : 0;
+    const score = aspectScore + emptyScore + densityScore;
+    if (score < best.score) {
+      best = { columns, rows, score };
+    }
+  }
+  return best;
 }
 
 function buildPhotoWallScatterPosition(index: number, total: number, wallSlot: THREE.Vector3) {
   const seed = hash01(index * 43 + total * 7);
-  const side = seed < 0.5 ? -1 : 1;
-  const verticalSide = hash01(index * 47 + 5) < 0.34;
-  const x = verticalSide
-    ? wallSlot.x + (hash01(index * 53 + 7) - 0.5) * 4.2
-    : side * (7.8 + hash01(index * 59 + 11) * 4.8);
-  const y = verticalSide
-    ? (seed < 0.25 ? -1 : 1) * (4.8 + hash01(index * 61 + 13) * 2.5)
-    : wallSlot.y + (hash01(index * 67 + 17) - 0.5) * 5.2;
-  const z = -8.4 - hash01(index * 71 + 19) * 7.6;
+  const z = -lerp(Math.abs(PHOTO_RUSH_CONFIG.deepZMin), Math.abs(PHOTO_RUSH_CONFIG.deepZMax), hash01(index * 71 + 19));
+  const bounds = getVisibleBoundsAtZ(z, PHOTO_RUSH_CONFIG.cameraZ, getViewportAspect());
+  const sideRoll = hash01(index * 47 + 5);
+  const xRoll = hash01(index * 53 + 7);
+  const yRoll = hash01(index * 59 + 11);
+  const edgeX = bounds.halfWidth * PHOTO_RUSH_CONFIG.farPlaneMargin;
+  const edgeY = bounds.halfHeight * PHOTO_RUSH_CONFIG.farPlaneMargin;
+  let x = (xRoll - 0.5) * bounds.halfWidth * 2;
+  let y = (yRoll - 0.5) * bounds.halfHeight * 2;
+
+  if (sideRoll < 0.24) {
+    x = -edgeX - hash01(index * 61 + 13) * bounds.halfWidth * 0.22;
+  } else if (sideRoll < 0.48) {
+    x = edgeX + hash01(index * 67 + 17) * bounds.halfWidth * 0.22;
+  } else if (sideRoll < 0.68) {
+    y = edgeY + hash01(index * 73 + 23) * bounds.halfHeight * 0.22;
+  } else if (sideRoll < 0.88) {
+    y = -edgeY - hash01(index * 79 + 29) * bounds.halfHeight * 0.22;
+  }
+
+  x += wallSlot.x * 0.18 + Math.sin(seed * Math.PI * 2) * 1.8;
+  y += wallSlot.y * 0.18 + Math.cos(seed * Math.PI * 2) * 1.2;
   return new THREE.Vector3(x, y, z);
+}
+
+function buildPhotoWallRushControlPosition(index: number, total: number, scatter: THREE.Vector3, wallSlot: THREE.Vector3) {
+  const near = buildPhotoWallNearPosition(index, total, wallSlot);
+  const sidePull = Math.sign(scatter.x || hash01(index * 83 + 31) - 0.5);
+  near.x += sidePull * (1.2 + hash01(index * 89 + 37) * 2.4);
+  near.y += (hash01(index * 97 + total * 5) - 0.5) * 1.8;
+  return near;
+}
+
+function buildPhotoWallNearPosition(index: number, total: number, wallSlot: THREE.Vector3) {
+  const z = PHOTO_RUSH_CONFIG.nearZMin + hash01(index * 101 + total * 7) * (PHOTO_RUSH_CONFIG.nearZMax - PHOTO_RUSH_CONFIG.nearZMin);
+  const bounds = getVisibleBoundsAtZ(z, PHOTO_RUSH_CONFIG.cameraZ, getViewportAspect());
+  const angle = hash01(index * 103 + 41) * Math.PI * 2;
+  const radius = 0.46 + hash01(index * 107 + 43) * 0.52;
+  return new THREE.Vector3(
+    Math.cos(angle) * bounds.halfWidth * PHOTO_RUSH_CONFIG.nearPlaneMargin * radius + wallSlot.x * 0.16,
+    Math.sin(angle) * bounds.halfHeight * PHOTO_RUSH_CONFIG.nearPlaneMargin * radius + wallSlot.y * 0.16,
+    z,
+  );
 }
 
 function buildTreePhotoPosition(index: number, total: number) {
@@ -1720,6 +1929,44 @@ function cubicBezier(a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: TH
   );
 }
 
+function createPhotoMaterial(texture: THREE.Texture, blurredTexture: THREE.Texture, opacity: number) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uMap: { value: texture },
+      uBlurMap: { value: blurredTexture },
+      uOpacity: { value: opacity },
+      uBlurMix: { value: 1 },
+      uDim: { value: 0.92 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D uMap;
+      uniform sampler2D uBlurMap;
+      uniform float uOpacity;
+      uniform float uBlurMix;
+      uniform float uDim;
+      varying vec2 vUv;
+
+      void main() {
+        vec4 sharpColor = texture2D(uMap, vUv);
+        vec4 blurColor = texture2D(uBlurMap, vUv);
+        vec4 color = mix(sharpColor, blurColor, clamp(uBlurMix, 0.0, 1.0));
+        color.rgb *= uDim;
+        gl_FragColor = vec4(color.rgb, color.a * uOpacity);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+  });
+}
+
 function createGlowTexture() {
   const canvas = document.createElement("canvas");
   canvas.width = 256;
@@ -1865,6 +2112,7 @@ function disposeParticleLayers(layers: ParticleLayers | null) {
   disposePointsLayer(layers.ambient.points, layers.ambient.geometry);
   disposePointsLayer(layers.groundPetals.points, layers.groundPetals.geometry);
   disposePetalRainLayer(layers.petalRain);
+  disposeCoupleKissParticleSystem(layers.coupleKiss);
 }
 
 function disposePhotoShardLayer(layer: PhotoShardLayer | null, scene: THREE.Scene) {
@@ -1915,18 +2163,55 @@ function completeIntroPhaseIfReady(
 
 function getIntroDuration(phase: IntroPhase, speed: number) {
   const normalizedSpeed = Math.max(0.1, speed);
+  const tempoScale = getIntroTempoScale(normalizedSpeed);
   if (phase === "photo-wall-enter") {
-    return Math.max(INTRO_TIMING.wallMinMs, INTRO_TIMING.wallBaseMs / normalizedSpeed);
+    return Math.max(INTRO_TIMING.wallMinMs, INTRO_TIMING.wallBaseMs * tempoScale);
   }
   if (phase === "wall-to-tree") {
-    return Math.max(INTRO_TIMING.morphMinMs, INTRO_TIMING.morphBaseMs / normalizedSpeed);
+    return Math.max(INTRO_TIMING.morphMinMs, INTRO_TIMING.morphBaseMs * tempoScale);
   }
   return 0;
 }
 
 function getIntroEntryDelay(entry: PhotoEntry, index: number, speed: number) {
-  const tempoScale = Math.max(0.72, Math.min(1.08, INTRO_TIMING.speedAnchor / Math.max(1, speed)));
-  return (40 + hash01(index * 157 + entry.wallShardSeed * 29) * 280) * tempoScale;
+  return (PHOTO_RUSH_CONFIG.spawnDelayMinMs + hash01(index * 157 + entry.wallShardSeed * 29) * PHOTO_RUSH_CONFIG.spawnDelayMaxMs) * getIntroTempoScale(speed);
+}
+
+function getIntroTempoScale(speed: number) {
+  return Math.max(0.72, Math.min(1.18, INTRO_TIMING.speedAnchor / Math.max(0.1, speed)));
+}
+
+function getViewportAspect() {
+  if (typeof window === "undefined") {
+    return 16 / 9;
+  }
+  return Math.max(0.58, Math.min(2.4, window.innerWidth / Math.max(1, window.innerHeight)));
+}
+
+function getVisibleBoundsAtZ(z: number, cameraZ: number, aspect: number) {
+  const distance = Math.max(0.1, cameraZ - z);
+  const halfHeight = Math.tan(THREE.MathUtils.degToRad(48) / 2) * distance;
+  return {
+    halfHeight,
+    halfWidth: halfHeight * aspect,
+  };
+}
+
+function getDepthOfFieldBlur(z: number) {
+  const farBlur = smoothstep(-9, -48, z) * 0.58;
+  const closeBlur = smoothstep(3.2, 7.1, z) * 0.48;
+  const wallPlaneBlur = Math.abs(z - PHOTO_RUSH_CONFIG.wallLookZ) < 2.4 ? 0 : 0.045;
+  return clamp(Math.max(farBlur, closeBlur, wallPlaneBlur), 0, 0.68);
+}
+
+function quadraticBezier(a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, t: number) {
+  const mt = 1 - clamp(t, 0, 1);
+  const ct = 1 - mt;
+  return new THREE.Vector3(
+    mt * mt * a.x + 2 * mt * ct * b.x + ct * ct * c.x,
+    mt * mt * a.y + 2 * mt * ct * b.y + ct * ct * c.y,
+    mt * mt * a.z + 2 * mt * ct * b.z + ct * ct * c.z,
+  );
 }
 
 function hash01(value: number) {
@@ -1947,6 +2232,11 @@ function easeOutCubic(value: number) {
   return 1 - Math.pow(1 - t, 3);
 }
 
+function easeOutExpo(value: number) {
+  const t = clamp(value, 0, 1);
+  return t === 1 ? 1 : 1 - Math.pow(2, -8.5 * t);
+}
+
 function easeOutBack(value: number) {
   const t = clamp(value, 0, 1);
   const c1 = 1.36;
@@ -1957,4 +2247,9 @@ function easeOutBack(value: number) {
 function easeInOutCubic(value: number) {
   const t = clamp(value, 0, 1);
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+function smoothstep(edge0: number, edge1: number, value: number) {
+  const t = clamp((value - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
 }
